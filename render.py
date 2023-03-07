@@ -4,7 +4,9 @@ import numpy as np
 
 from model import NeRF
 
-def get_rays(H:int, W:int, K:np.ndarray, c2w:torch.Tensor):
+from typing import Tuple, Callable
+
+def get_rays(H:int, W:int, K:np.ndarray, c2w:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     '''
         Get the origins and directions of all rays of the image in the world coordinate.
 
@@ -12,12 +14,12 @@ def get_rays(H:int, W:int, K:np.ndarray, c2w:torch.Tensor):
         Args:
             H: int. Height of image in pixels.
             W: int. Width of image in pixels.
-            K: <class 'numpy.ndarray'>. size (3, 3). Intrinsic matrix.
-            c2w:  <class 'torch.Tensor'>. size (3, 4). Camera to World matrix.
+            K: numpy.ndarray. size (3, 3). Intrinsic matrix.
+            c2w:  torch.Tensor. size (3, 4). Camera to World matrix.
         
         Returns:
-            rays_o:  <class 'torch.Tensor'>. size (H, W, 3). coordinates of camera. 
-            rays_d:  <class 'torch.Tensor'>. size (H, W, 3). directions of rays.
+            rays_o: torch.Tensor. size (H, W, 3). Coordinates of camera. 
+            rays_d: torch.Tensor. size (H, W, 3). Directions of rays.
     '''
 
     x, y = torch.meshgrid(torch.linspace(0, W - 1, W), torch.linspace(0, H - 1, H), indexing='xy')
@@ -33,8 +35,17 @@ def get_rays(H:int, W:int, K:np.ndarray, c2w:torch.Tensor):
     return rays_o, rays_d
 
 
-def _model_batch(model:NeRF, network_chunk:int):
-    def func(pos_embed, dirs_embed):
+def _model_batch(model:NeRF, network_chunk:int) -> Callable:
+    '''
+        Args:
+            model: model.NeRF. Model NeRF.
+            network_chunk: int. Number of points sent through network in parallel.
+
+        Returns:
+            func: function. It feeds a small chunk of data each time to the model NeRF.
+    '''
+
+    def func(pos_embed:torch.Tensor, dirs_embed:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         N = pos_embed.shape[0]
         ret = [model(pos_embed[i: i + network_chunk], dirs_embed[i: i + network_chunk]) for i in range(0, N, network_chunk)]
         ret = torch.cat(ret, dim=0)
@@ -43,9 +54,29 @@ def _model_batch(model:NeRF, network_chunk:int):
 
 
 def _propogate(N_rays:int, N_samples:int, pos_embed:torch.Tensor, dirs_embed:torch.Tensor, model:NeRF,
-               z_vals:torch.Tensor, rays_d:torch.Tensor, raw_noise_std:float, white_bkgd:bool, network_chunk:int):
+               z_vals:torch.Tensor, rays_d:torch.Tensor, raw_noise_std:float, white_bkgd:bool, network_chunk:int) -> Tuple[torch.Tensor, torch.Tensor]:
     '''
         Forward propogate to get RGB + alpha, then do volume rendering.
+
+        Args:
+            N_rays: int. Number of rays.
+            N_samples: int. Number of sample points of each ray.
+            pos_embed: torch.Tensor. size (N_rays * N_samples, output_dim).
+            dirs_embed: torch.Tensor. size (N_rays * N_samples, output_dim).
+
+            model: model.NeRF. Model NeRF.
+
+            z_vals: torch.Tensor. size (N_rays, N_samples). Depths of sample points.
+            rays_d: torch.Tensor. size (render_chunk, 3). Directions of the rays.
+
+            raw_noise_std: float. Standard deviation of noise (Gaussian) added to regularize sigma output.
+            white_bkgd: bool. Whether to render synthetic data on a white background.
+
+            network_chunk: int. Number of points sent through network in parallel.
+
+        Returns:
+            colors: torch.Tensor.
+            weights: torch.Tensor.
     '''
 
     rgb, alpha = _model_batch(model, network_chunk)(pos_embed, dirs_embed)
@@ -67,7 +98,7 @@ def _propogate(N_rays:int, N_samples:int, pos_embed:torch.Tensor, dirs_embed:tor
     weights = sigma * T # (N_rays, N_samples)
 
     color = torch.sum(weights[:, :, None] * rgb, dim=-2) # (N_rays, 3)
-    acc = torch.sum(weights, dim=-1)
+    acc = torch.sum(weights, dim=-1) # (N_rays)
 
     if white_bkgd:
         color = color + (1 - acc[:, None])
@@ -75,12 +106,16 @@ def _propogate(N_rays:int, N_samples:int, pos_embed:torch.Tensor, dirs_embed:tor
     return color, weights
 
 
-def _sample_pdf(bins, weights, N_samples, det=False, pytest=False):
+def _sample_pdf(bins:torch.Tensor, weights:torch.Tensor, N_samples:int, det=False) -> torch.Tensor:
+    '''
+        Sample more points for the fine model by p.d.f.
+    '''
+
     # Get pdf
-    weights = weights + 1e-5 # prevent nans
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
-    cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)  # (batch, len(bins))
+    weights = weights + 1e-5 # prevent NaNs
+    pdf = weights / torch.sum(weights, -1, keepdim=True) # (N_rays, N_samples)
+    cdf = torch.cumsum(pdf, dim=-1) # (N_rays)
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)  # (batch, len(bins))
 
     # Take uniform samples
     if det:
@@ -89,17 +124,6 @@ def _sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     else:
         u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
 
-    # Pytest, overwrite u with numpy's fixed random numbers
-    if pytest:
-        np.random.seed(0)
-        new_shape = list(cdf.shape[:-1]) + [N_samples]
-        if det:
-            u = np.linspace(0., 1., N_samples)
-            u = np.broadcast_to(u, new_shape)
-        else:
-            u = np.random.rand(*new_shape)
-        u = torch.Tensor(u)
-
     # Invert CDF
     u = u.contiguous()
     inds = torch.searchsorted(cdf, u, right=True)
@@ -107,30 +131,28 @@ def _sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
     inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
 
-    # cdf_g = tf.gather(cdf, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
-    # bins_g = tf.gather(bins, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
 
-    denom = (cdf_g[...,1]-cdf_g[...,0])
-    denom = torch.where(denom<1e-5, torch.ones_like(denom), denom)
-    t = (u-cdf_g[...,0])/denom
+    denom = (cdf_g[...,1] - cdf_g[...,0])
+    denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    t = (u - cdf_g[...,0])/denom
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
 
 
-def _render(rays_packed:torch.Tensor, render_args:dict):
+def _render(rays_packed:torch.Tensor, render_args:dict) -> torch.Tensor:
     '''
         Render rays in a chunk.
 
         Args:
-            rays_packed: <class 'torch.Tensor'>. size [2, batch_size, 3]. Ray origin and direction for each example in batch.
-            render_args: `train_args` or `test_args`.
+            rays_packed: torch.Tensor. size (2, batch_size, 3). Ray origin and direction for each example in batch.
+            render_args: dict. `train_args` or `test_args`.
 
         Returns:
-            ret: <class 'torch.Tensor'>. size [2, chunk, 3]. Predicted RGB values for rays by fine model and coarse model.
+            ret: torch.Tensor. size (2, chunk, 3). Predicted RGB values for rays by fine model and coarse model.
     '''
 
     model         = render_args['network']
@@ -177,8 +199,8 @@ def _render(rays_packed:torch.Tensor, render_args:dict):
     dirs = dirs.reshape([N_rays * N_samples, 3])
 
     # Position Embedding
-    pos_embed = embedder(pos)
-    dirs_embed = embedder_dirs(dirs)
+    pos_embed = embedder(pos) # (N_rays * N_samples, embbder.output_dim)
+    dirs_embed = embedder_dirs(dirs) # (N_rays * N_samples, embedder_dirs.output_dim)
 
     # Forward Propogate
     color_0, weights = _propogate(N_rays, N_samples, pos_embed, dirs_embed, model,
@@ -214,26 +236,42 @@ def _render(rays_packed:torch.Tensor, render_args:dict):
     return torch.cat([color, color_0], dim=-1)
 
 
-def render_batch(rays_packed:torch.Tensor, render_args:dict, render_chunk:int):
+def render_batch(rays_packed:torch.Tensor, render_args:dict, render_chunk:int) -> Tuple[torch.Tensor, torch.Tensor]:
     '''
-        Render rays
+        Render rays in multiple batches.
 
         Args:
-            rays_packed: <class 'torch.Tensor'>. size [2, batch_size, 3]. Ray origin and direction for each example in batch.
-            render_args: `train_args` or `test_args`.
+            rays_packed: torch.Tensor. size (2, batch_size, 3). Ray origin and direction for each example in batch.
+            render_args: dict. `train_args` or `test_args`.
 
         Returns:
-            rgb: [batch_size, 3]. Predicted RGB values for rays by fine model.
-            rgb_0: [batch_size, 3]. Predicted RGB values for rays by coarse model.
+            rgb: torch.Tensor. size (batch_size, 3). Predicted RGB values for rays by fine model.
+            rgb_0: torch.Tensor. size (batch_size, 3). Predicted RGB values for rays by coarse model.
     '''
 
-    N_rays = rays_packed.shape[1]
+    N_rays = rays_packed.shape[1] # batch_size
     ret = [_render(rays_packed[:, i: i + render_chunk, :], render_args) for i in range(0, N_rays, render_chunk)]
     ret = torch.cat(ret, dim=0)
     return ret[:, :3], ret[:, 3:]
 
 
-def _render_test(H:int, W:int, K:np.ndarray, pose:torch.Tensor, render_args:dict, render_chunk:int):
+def _render_test(H:int, W:int, K:np.ndarray, pose:torch.Tensor, render_args:dict, render_chunk:int) -> Tuple[torch.Tensor, torch.Tensor]:
+    '''
+        Render an image of given pose.
+
+        Args:
+            H: int. Height of the image to render.
+            W: int. Width of the image to render.
+            K: numpy.ndarray. size (3, 3). Intrinsic matrix.
+            pose: torch.Tensor. size (4, 4). Extrinsic matrix.
+            render_args: dict. `test_args`.
+            render_chunk: int. Number of rays processed in parallel.
+
+        Returns:
+            rgb: torch.Tensor. size (H * W, 3). Predicted RGB values for rays by fine model.
+            _: torch.Tensor. size (H * W, 3). Predicted RGB values for rays by coarse model. But we don't care it when rendering the final video.
+    '''
+
     rays_o, rays_d = get_rays(H, W, K, pose[:3, :4])
     rays_o = torch.reshape(rays_o, [-1, 3])
     rays_d = torch.reshape(rays_d, [-1, 3])
@@ -241,18 +279,18 @@ def _render_test(H:int, W:int, K:np.ndarray, pose:torch.Tensor, render_args:dict
     return render_batch(rays_packed, render_args, render_chunk)
 
 
-def render_path(render_poses:torch.Tensor, hwf:list, K:np.ndarray, render_args:dict, render_chunk:int):
+def render_path(render_poses:torch.Tensor, hwf:list, K:np.ndarray, render_args:dict, render_chunk:int) -> np.ndarray:
     '''
         Render the result or test data.
 
         Args:
-            render_poses: <class 'numpy.ndarray'>. size (N, 3, 4). the camera poses where the images are needed to render.
-            hwf: <class 'list'>. [height, width, focal length].
-            K: <class 'numpy.ndarray'> [3, 3]. the intrinsic matrix.
-            render_args: dict. args for render process.
+            render_poses: numpy.ndarray. size (N, 3, 4). Camera poses where the images are needed to render.
+            hwf: list. [height, width, focal length].
+            K: numpy.ndarray. size (3, 3). Intrinsic matrix.
+            render_args: dict. `test_args`.
 
         Returns:
-            rgbs: <class 'list'>. size [H * W, 3].
+            rgbs: numpy.ndarray. size (H * W, 3). Predicted RGB values for rays by fine model.
     '''
 
     from tqdm import tqdm

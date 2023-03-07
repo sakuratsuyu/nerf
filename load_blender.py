@@ -7,11 +7,12 @@ import cv2
 def _pose_spherical(radius:float, theta:float, phi:float):
     '''
         Args:
-            radius, theta, phi: float. spherical coordinates.
+            radius, theta, phi: float. Spherical coordinates.
 
         Returns:
-            c2w: <class 'tensor'>. corresponding Camera to world matrix.
+            c2w: tensor. Corresponding Camera to world matrix.
     '''
+
     trans_radius = lambda r : torch.Tensor([
                                                [1, 0, 0, 0],
                                                [0, 1, 0, 0],
@@ -48,12 +49,12 @@ def load_blender_data(basedir:str, half_res=False):
         Load Data with blender format.
 
         Args:
-            basedir: string. path of the data directory.
-            half_res: boolean. whether to downsample (half resolution).
+            basedir: string. Path of the data directory.
+            half_res: bool. Whether to downsample (half resolution).
 
         Returns:
-            imgs: <class 'numpy.ndarray'>. size (N, H, W, C). NOTE that the images have 4 channels (RGBA).
-            poses: <class 'numpy.ndarray'>. size (N, 4, 4). poses of each imgs.
+            imgs: numpy.ndarray. size (N, H, W, C). NOTE that the images have 4 channels (RGBA).
+            poses: numpy.ndarray. size (N, 4, 4). Poses of each imgs.
                 
                 NOTE: `poses[:, :, i]` of each image is of the form
                     - R is a 3 by 3 roation matrix.
@@ -68,8 +69,8 @@ def load_blender_data(basedir:str, half_res=False):
                  │     └───────┘└───┘
                  │  3   0  0  0   1
 
-            rendered_poses: <class 'numpy.ndarray'>. size (40, 4, 4). poses to render, in the same form of extrinsic matrix.
-            indices: <class 'list'>, a list of list. size (idx_train, idx_val, idx_test). each element is a list of indices of images.
+            rendered_poses: numpy.ndarray. size (40, 4, 4). Poses to render, in the same form of extrinsic matrix.
+            indices: list, a list of list. size (idx_train, idx_val, idx_test). Each element is a list of indices of images.
     '''
 
     splits = ['train', 'val', 'test']

@@ -1,5 +1,6 @@
 import os
 import imageio
+import configargparse
 
 import torch
 import numpy as np
@@ -7,30 +8,32 @@ import numpy as np
 from tqdm import tqdm, trange
 
 from load_blender import load_blender_data
-from model import *
-from render import *
+from model import NeRF, Embedder
+from render import get_rays, render_batch, render_path
+
+from typing import Tuple
+from torch.optim import Optimizer
 
 torch.set_default_tensor_type('torch.cuda.FloatTensor')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 
-# Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10.0 * torch.log(x) / torch.log(torch.Tensor([10.0]))
 to8b = lambda x : (255 * np.clip(x, 0, 1)).astype(np.uint8)
 
-def create_nerf(args):
+def create_nerf(args) -> Tuple[dict, dict, int, Optimizer]:
     '''
         Initiate NeRF Model.
 
         Args:
-            args: <class 'argparse.Namespace'>. args of NeRF model.
+            args: argparse.Namespace. Args of NeRF model.
         
         Returns:
-            train_args: dict. args to train the model.
-            test_args: dict. args to test the model.
-            start:  int. the start step.
-            optimizer: <class 'torch.optim.adam.Adam'>. the Adam optimizer.
+            train_args: dict. Args to train the model.
+            test_args: dict. Args to test the model.
+            start:  int. Start step.
+            optimizer: torch.optim.adam.Adam. Adam optimizer.
     '''
 
     # Initiate Embedder
@@ -121,10 +124,16 @@ def create_nerf(args):
     return train_args, test_args, start, optimizer
 
 
-def config_parser():
-    import configargparse
+def config_parser() -> configargparse.ArgumentParser:
+    '''
+        Deal with configs.
+
+        Returns:
+            parser. configargparse.ArgumentParser.
+    '''
 
     parser = configargparse.ArgumentParser()
+
     parser.add_argument('--config', is_config_file=True,
                         help='config file path')
     parser.add_argument("--expname", type=str,
@@ -154,8 +163,6 @@ def config_parser():
                         help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--network_chunk", type=int, default=1024 * 64,
                         help='number of pts sent through network in parallel, decrease if running out of memory')
-    parser.add_argument("--no_batching", action='store_true',
-                        help='only take random rays from 1 image at a time')
 
     ## Load Model
     parser.add_argument("--no_reload", action='store_true',
@@ -166,14 +173,17 @@ def config_parser():
                         help='number of coarse samples per ray')
     parser.add_argument("--N_importance", type=int, default=0,
                         help='number of additional fine samples per ray')
+
     parser.add_argument("--near", type=float, default=2.0,
                         help='near bound')
     parser.add_argument("--far", type=float, default=6.0,
                         help='far bound')
+
     parser.add_argument("--num_freq", type=int, default=10,
                         help='log2 of max freq for positional encoding (3D location)')
     parser.add_argument("--num_freq_views", type=int, default=4,
                         help='log2 of max freq for positional encoding (2D direction)')
+
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')
     parser.add_argument("--raw_noise_std", type=float, default=0.0,

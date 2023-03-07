@@ -6,12 +6,11 @@ class NeRF(nn.Module):
     def __init__(self, layer = 8, channel = 256, skips = [4], input_ch = 3, input_ch_views = 3) -> None:
         '''
             Args:
-                layer: int. number of layers.
-                channel: int. number of channels.
-                input_ch: int. number of position input channel.
-                input_ch_views: int, number of direction input channel.
-                skips: int. index of the layer that adds position encoding again.
-                use_viewdirs: boolean. whether to use 5D input.
+                layer: int. Number of layers.
+                channel: int. Number of channels.
+                skips: list. Index of the layer that adds position encoding again.
+                input_ch: int. Number of position input channel.
+                input_ch_views: int. Number of direction input channel.
         '''
 
         super(NeRF, self).__init__()
@@ -32,16 +31,16 @@ class NeRF(nn.Module):
         self.alpha_linear = nn.Linear(channel, 1)
         self.rgb_linear = nn.Linear(channel // 2, 3)
 
-    def forward(self, input_pos:torch.Tensor, input_views:torch.Tensor):
+    def forward(self, input_pos:torch.Tensor, input_views:torch.Tensor) -> torch.Tensor:
         '''
             From (pos + dir) to (RGB + sigma).
 
             Args:
-                input_pos: <class 'torch.Tensor'>. (batch, 3). batch input of position(3D)
-                input_views: <class 'torch.Tensor'>. (batch, 3). batch input of direction(3D).
+                input_pos: torch.Tensor. size (batch, 3). Batch input of position(3D)
+                input_views: torch.Tensor. size (batch, 3). Batch input of direction(3D).
 
             Returns:
-                output: <class 'numpy.ndarray'>. (batch, 3 + 1). batch output of RGB(3D) and sigma(1D).
+                output: torch.Tensor. size (batch, 3 + 1). Batch output of RGB(3D) and sigma(1D).
         '''
 
         temp = input_pos
@@ -65,13 +64,13 @@ class NeRF(nn.Module):
         return torch.cat([rgb, alpha], dim=-1)
 
 class Embedder:
-    def __init__(self, input_dim, max_freq_log, num_freq, include_input):
+    def __init__(self, input_dim:int, max_freq_log:int, num_freq:int, include_input:bool) -> None:
         '''
             Args:
-                input_dim: int. input dimension.
-                max_freq_log: int. log 2 of embedded maximum frequency.
-                num_freq: int. number of embedded frequencies.
-                include_input: boolean. whether to include input for Embedder.
+                input_dim: int. Input dimension.
+                max_freq_log: int. Logarithm to base 2 of embedded maximum frequency.
+                num_freq: int. Number of embedded frequencies.
+                include_input: bool. Whether to include input for Embedder.
         '''
 
         fns = [torch.cos, torch.sin]
@@ -95,5 +94,15 @@ class Embedder:
         self.output_dim = len(embed_fns) * input_dim
         self.embed_fns = embed_fns
 
-    def __call__(self, input):
+    def __call__(self, input) -> torch.Tensor:
+        '''
+            Embed input.
+
+            Args:
+                input: torch.Tensor. size (N_rays * N_samples, 3). Batch of positions of directions.
+
+            Returns:
+                _: torch.Tensor. size (N_rays * N_samples, output_dim). Batch of embedded positions or directions
+        '''
+
         return torch.cat([fn(input) for fn in self.embed_fns], dim=-1)
