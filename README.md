@@ -25,7 +25,7 @@ conda install --yes --file requirements-conda.txt
 #### Run
 
 ```shell
-python --configs ./configs/lego.txt
+python train.py --config ./configs/lego.txt
 ```
 
 ![](imgs/lego.gif)
