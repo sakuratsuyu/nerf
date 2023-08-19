@@ -1,0 +1,12 @@
+ConfigArgParse==1.5.3
+imageio==2.26.0
+numpy==1.24.1
+nvidia-cublas-cu11==11.10.3.66
+nvidia-cuda-nvrtc-cu11==11.7.99
+nvidia-cuda-runtime-cu11==11.7.99
+nvidia-cudnn-cu11==8.5.0.96
+opencv-python==4.8.0.74
+Pillow==10.0.0
+torch==1.13.1
+tqdm==4.65.0
+typing_extensions==4.7.1
