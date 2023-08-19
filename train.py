@@ -317,7 +317,7 @@ def train():
         rays_packed = torch.stack([rays_o, rays_d], dim=0)            # (2, N_rand, 3)
         target = target[coords_selected[:, 0], coords_selected[:, 1]] # (N_rand, 3)
 
-        rgb, rgb0 = render_batch(rays_packed, train_args, args.render_chunk)
+        rgb, rgb0, _, _ = render_batch(rays_packed, train_args, args.render_chunk)
 
         # Loss
         optimizer.zero_grad()
@@ -352,10 +352,11 @@ def train():
         ## Render the video
         if i % args.i_video == 0:
             with torch.no_grad():
-                rgbs = render_path(render_poses, hwf, K, test_args, args.render_chunk)
+                rgbs, depths = render_path(render_poses, hwf, K, test_args, args.render_chunk)
             print('Done, saving', rgbs.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+            imageio.mimwrite(moviebase + 'depth.mp4', to8b(depths / np.max(depths)), fps=30, quality=8)
 
         ## Save the model
         if i % args.i_weights == 0:

@@ -67,7 +67,7 @@ def _propogate(N_rays:int, N_samples:int, pos_embed:torch.Tensor, dirs_embed:tor
             model: model.NeRF. Model NeRF.
 
             z_vals: torch.Tensor. size (N_rays, N_samples). Depths of sample points.
-            rays_d: torch.Tensor. size (render_chunk, 3). Directions of the rays.
+            rays_d: torch.Tensor. size (N_rays, 3). Directions of the rays.
 
             raw_noise_std: float. Standard deviation of noise (Gaussian) added to regularize sigma output.
             white_bkgd: bool. Whether to render synthetic data on a white background.
@@ -79,9 +79,9 @@ def _propogate(N_rays:int, N_samples:int, pos_embed:torch.Tensor, dirs_embed:tor
             weights: torch.Tensor.
     '''
 
-    rgb, alpha = _model_batch(model, network_chunk)(pos_embed, dirs_embed)
+    rgb, sigma = _model_batch(model, network_chunk)(pos_embed, dirs_embed)
     rgb   =   rgb.reshape(N_rays, N_samples, 3)
-    alpha = alpha.reshape(N_rays, N_samples)
+    sigma = sigma.reshape(N_rays, N_samples)
 
     INF = 1e10
     dists = z_vals[:, 1:] - z_vals[:, :-1]
@@ -90,55 +90,67 @@ def _propogate(N_rays:int, N_samples:int, pos_embed:torch.Tensor, dirs_embed:tor
 
     noise = 0
     if raw_noise_std:
-        noise = torch.randn(alpha.shape) * raw_noise_std
+        noise = torch.randn(sigma.shape) * raw_noise_std
 
-    sigma = 1.0 - torch.exp(- dists * F.relu(alpha + noise))
-    t = torch.cat([torch.ones(sigma.shape[0], 1), 1.0 - sigma + 1e-10], dim=-1) # (N_rays, N_samples + 1)
+    alpha = 1.0 - torch.exp(- dists * F.relu(sigma + noise))
+    t = torch.cat([torch.ones(alpha.shape[0], 1), 1.0 - alpha + 1e-10], dim=-1) # (N_rays, N_samples + 1)
     T = torch.cumprod(t, dim=-1)[:, :-1] # (N_rays, N_samples)
-    weights = sigma * T # (N_rays, N_samples)
+    weights = alpha * T # (N_rays, N_samples)
 
     color = torch.sum(weights[:, :, None] * rgb, dim=-2) # (N_rays, 3)
+    depth = torch.sum(weights * z_vals, -1)[:, None]
     acc = torch.sum(weights, dim=-1) # (N_rays)
 
     if white_bkgd:
         color = color + (1 - acc[:, None])
 
-    return color, weights
+    return color, depth, weights
 
 
-def _sample_pdf(bins:torch.Tensor, weights:torch.Tensor, N_samples:int, det=False) -> torch.Tensor:
+def _sample_pdf(bins:torch.Tensor, weights:torch.Tensor, N_importance:int, det=False) -> torch.Tensor:
     '''
         Sample more points for the fine model by p.d.f.
+
+        Args:
+            bins: torch.Tensor. size (N_rays, N_samples - 1). z_vals_mid.
+            weights: torch.Tensor. size (N_rays, N_samples - 2). probability of the ray to stop at each sample point.
+            N_importance: int.
+            det: bool.
+
+        Returns:
+            samples: torch.Tensor.
     '''
 
     # Get pdf
     weights = weights + 1e-5 # prevent NaNs
-    pdf = weights / torch.sum(weights, -1, keepdim=True) # (N_rays, N_samples)
-    cdf = torch.cumsum(pdf, dim=-1) # (N_rays)
-    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)  # (batch, len(bins))
+    pdf = weights / torch.sum(weights, -1, keepdim=True) # (N_rays, N_samples - 2)
+    cdf = torch.cumsum(pdf, dim=-1) # (N_rays, N_samples - 2)
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)  # (N_rays, N_samples - 1)
 
     # Take uniform samples
     if det:
-        u = torch.linspace(0., 1., steps=N_samples)
-        u = u.expand(list(cdf.shape[:-1]) + [N_samples])
+        u = torch.linspace(0.0, 1.0, steps=N_importance)
+        u = u.expand(list(cdf.shape[:-1]) + [N_importance])
     else:
-        u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
+        u = torch.rand(list(cdf.shape[:-1]) + [N_importance])
 
     # Invert CDF
     u = u.contiguous()
-    inds = torch.searchsorted(cdf, u, right=True)
-    below = torch.max(torch.zeros_like(inds-1), inds-1)
-    above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
-    inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
+    idx = torch.searchsorted(cdf, u, right=True)
+    below = torch.max(torch.zeros_like(idx - 1), idx - 1)
+    above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(idx), idx)
+    idx_g = torch.stack([below, above], -1)  # (N_rays, N_importance, 2)
 
-    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
-    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
-    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
+    matched_shape = [idx_g.shape[0], idx_g.shape[1], cdf.shape[-1]]
+    # cdf_g[i, j, k] = cdf'[i, j, idx_g[i, j, k]]
+    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, idx_g)
+    # bins_g[i, j, k] = bins'[i, j, idx_g[i, j, k]]
+    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, idx_g)
 
-    denom = (cdf_g[...,1] - cdf_g[...,0])
+    denom = (cdf_g[..., 1] - cdf_g[..., 0])
     denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
-    t = (u - cdf_g[...,0])/denom
-    samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
+    t = (u - cdf_g[..., 0]) / denom
+    samples = bins_g[...,0] + t * (bins_g[..., 1] - bins_g[..., 0])
 
     return samples
 
@@ -148,7 +160,7 @@ def _render(rays_packed:torch.Tensor, render_args:dict) -> torch.Tensor:
         Render rays in a chunk.
 
         Args:
-            rays_packed: torch.Tensor. size (2, batch_size, 3). Ray origin and direction for each example in batch.
+            rays_packed: torch.Tensor. size (2, render_chunk, 3). Ray origin and direction for each example in batch.
             render_args: dict. `train_args` or `test_args`.
 
         Returns:
@@ -168,7 +180,7 @@ def _render(rays_packed:torch.Tensor, render_args:dict) -> torch.Tensor:
     white_bkgd    = render_args['white_bkgd']
     network_chunk = render_args['network_chunk']
 
-    N_rays = rays_packed.shape[1]
+    N_rays = rays_packed.shape[1] # N_rays = render_chunk
     rays_o, rays_d = rays_packed
 
     ## Coarse Network
@@ -203,7 +215,7 @@ def _render(rays_packed:torch.Tensor, render_args:dict) -> torch.Tensor:
     dirs_embed = embedder_dirs(dirs) # (N_rays * N_samples, embedder_dirs.output_dim)
 
     # Forward Propogate
-    color_0, weights = _propogate(N_rays, N_samples, pos_embed, dirs_embed, model,
+    color_0, depth_0, weights = _propogate(N_rays, N_samples, pos_embed, dirs_embed, model,
                                   z_vals, rays_d, raw_noise_std, white_bkgd, network_chunk)
 
     ## Fine Network
@@ -230,10 +242,10 @@ def _render(rays_packed:torch.Tensor, render_args:dict) -> torch.Tensor:
     pos_embed = embedder(pos)
     dirs_embed = embedder_dirs(dirs)
 
-    color, _ = _propogate(N_rays, N_samples + N_importance, pos_embed, dirs_embed, model_fine, 
+    color, depth, _ = _propogate(N_rays, N_samples + N_importance, pos_embed, dirs_embed, model_fine, 
                           z_vals, rays_d, raw_noise_std, white_bkgd, network_chunk)
 
-    return torch.cat([color, color_0], dim=-1)
+    return torch.cat([color, color_0], dim=-1), torch.cat([depth, depth_0], dim=-1)
 
 
 def render_batch(rays_packed:torch.Tensor, render_args:dict, render_chunk:int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -250,9 +262,16 @@ def render_batch(rays_packed:torch.Tensor, render_args:dict, render_chunk:int) -
     '''
 
     N_rays = rays_packed.shape[1] # batch_size
-    ret = [_render(rays_packed[:, i: i + render_chunk, :], render_args) for i in range(0, N_rays, render_chunk)]
-    ret = torch.cat(ret, dim=0)
-    return ret[:, :3], ret[:, 3:]
+    # color, depth = [_render(rays_packed[:, i: i + render_chunk, :], render_args) for i in range(0, N_rays, render_chunk)]
+    color = []
+    depth = []
+    for i in range(0, N_rays, render_chunk):
+        c, d = _render(rays_packed[:, i: i + render_chunk, :], render_args)
+        color.append(c)
+        depth.append(d)
+    color = torch.cat(color, dim=0)
+    depth = torch.cat(depth, dim=0)
+    return color[:, :3], color[:, 3:], depth[:, :1], depth[:, 1:]
 
 
 def _render_test(H:int, W:int, K:np.ndarray, pose:torch.Tensor, render_args:dict, render_chunk:int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -298,12 +317,16 @@ def render_path(render_poses:torch.Tensor, hwf:list, K:np.ndarray, render_args:d
     H, W, _ = hwf
 
     rgbs = []
+    depths = []
 
     for _, pose in enumerate(tqdm(render_poses)):
-        rgb, _ = _render_test(H, W, K, pose, render_args, render_chunk)
+        rgb, _, depth, _ = _render_test(H, W, K, pose, render_args, render_chunk)
         rgb = rgb.reshape(H, W, 3)
         rgbs.append(rgb.cpu().numpy())
+        depth = depth.reshape(H, W, 1)
+        depths.append(depth.cpu().numpy())
 
     rgbs = np.stack(rgbs, axis=0)
+    depths = np.stack(depths, axis=0)
 
-    return rgbs
+    return rgbs, depths
